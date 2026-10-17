@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                Reddit Absolute Dates
-// @namespace           https://github.com/PacificCosmophile/
+// @namespace           https://github.com/PacificCosmophile
 // @description         Replaces Reddit's relative timestamps with clear, absolute dates.
 // @version             1.5
 // @author              PacificCosmophile+Vibecoded
