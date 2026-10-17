@@ -11,6 +11,7 @@
 // @downloadURL         https://update.greasyfork.org/scripts/588396/Reddit%20Absolute%20Dates.user.js
 // @updateURL           https://update.greasyfork.org/scripts/588396/Reddit%20Absolute%20Dates.meta.js
 // @match               https://reddit.com/*
+// @match               https://www.reddit.com/*
 // @require             https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js
 // @grant               GM_getValue
 // @grant               GM_setValue
