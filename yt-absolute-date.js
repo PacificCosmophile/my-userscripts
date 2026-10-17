@@ -2,7 +2,7 @@
 // @name             YT Absolute Date
 // @namespace        https://github.com/PacificCosmophile
 // @description      Replaces relative upload dates ("2 years ago") with absolute dates across YouTube.
-// @version          2.0
+// @version          2.1
 // @author           PacificCosmophile+Vibecoded
 // @license          MIT
 // @match            https://www.youtube.com/*
@@ -60,6 +60,10 @@
     const DEBOUNCE_DELAY = 50;
     const TIMER_INTERVAL = 1000;
     const IDLE_TIMEOUT = 500;
+
+    // How long the login headers of a request are reused. They contain a hash
+    // with a timestamp, so they are rebuilt now and then (milliseconds).
+    const AUTH_HEADERS_TTL = 5 * 60 * 1000;
 
     // =========================================================================
     // Utils
@@ -170,24 +174,122 @@
         // so it can be retried on a later run.
         _requests: new Map(),
 
-        async _fetch(videoId) {
-            const body = {
-                context: { client: { clientName: 'WEB', clientVersion: '2.20240416.01.00' } },
-                videoId: videoId
+        // Login headers, shared by all requests until they get too old. This is
+        // a Promise, so videos requested at the same moment build them only once.
+        _authHeaders: null,
+        _authHeadersTime: 0,
+
+        /**
+         * Read the settings YouTube's own page uses for its requests, so the
+         * client version never gets outdated.
+         *
+         * @returns {Object|null} The settings, or null when the page has none yet.
+         */
+        _getPageConfig() {
+            const cfg = window.ytcfg;
+            if (typeof cfg?.get !== 'function') {
+                return null;
+            }
+
+            const clientVersion = cfg.get('INNERTUBE_CLIENT_VERSION');
+            return {
+                apiKey: cfg.get('INNERTUBE_API_KEY'),
+                context: cfg.get('INNERTUBE_CONTEXT') ?? { client: { clientName: 'WEB', clientVersion } },
+                clientName: cfg.get('INNERTUBE_CLIENT_NAME'),
+                clientVersion: clientVersion,
+                visitorData: cfg.get('VISITOR_DATA')
             };
+        },
+
+        _getCookie(name) {
+            const prefix = name + '=';
+            const entry = document.cookie.split('; ').find(cookie => cookie.startsWith(prefix));
+            return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
+        },
+
+        async _sha1Hex(text) {
+            const buffer = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+            return Array.from(new Uint8Array(buffer))
+                .map(byte => byte.toString(16).padStart(2, '0'))
+                .join('');
+        },
+
+        /**
+         * YouTube's own page proves who you are with a hash made from the
+         * SAPISID cookies. Without it the request counts as anonymous and can
+         * be rejected with LOGIN_REQUIRED. When you are logged out there are no
+         * such cookies, and the request is sent without them.
+         */
+        async _buildAuthHeaders(config) {
+            const headers = { 'Content-Type': 'application/json' };
+            const origin = location.origin;
+            const timestamp = Math.floor(Date.now() / 1000);
+
+            const authorizations = [];
+            for (const [cookieName, headerName] of [
+                ['SAPISID', 'SAPISIDHASH'],
+                ['__Secure-1PAPISID', 'SAPISID1PHASH'],
+                ['__Secure-3PAPISID', 'SAPISID3PHASH']
+            ]) {
+                const sid = this._getCookie(cookieName);
+                if (sid) {
+                    const hash = await this._sha1Hex(`${timestamp} ${sid} ${origin}`);
+                    authorizations.push(`${headerName} ${timestamp}_${hash}`);
+                }
+            }
+
+            if (authorizations.length > 0) {
+                headers['Authorization'] = authorizations.join(' ');
+                headers['X-Origin'] = origin;
+            }
+            if (config.visitorData) {
+                headers['X-Goog-Visitor-Id'] = config.visitorData;
+            }
+            return headers;
+        },
+
+        _getAuthHeaders(config) {
+            if (!this._authHeaders || Date.now() - this._authHeadersTime > AUTH_HEADERS_TTL) {
+                this._authHeadersTime = Date.now();
+                this._authHeaders = this._buildAuthHeaders(config).catch(error => {
+                    this._authHeaders = null; // Do not keep a failure for the whole TTL.
+                    throw error;
+                });
+            }
+            return this._authHeaders;
+        },
+
+        async _fetch(videoId) {
+            // The page has not set up its config yet. This is retried on a later run.
+            const config = this._getPageConfig();
+            if (!config) {
+                return undefined;
+            }
 
             try {
-                const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+                const headers = { ...await this._getAuthHeaders(config) };
+                if (config.clientName !== undefined && config.clientName !== null) {
+                    headers['X-Youtube-Client-Name'] = String(config.clientName);
+                }
+                if (config.clientVersion) {
+                    headers['X-Youtube-Client-Version'] = config.clientVersion;
+                }
+
+                const url = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
+                    + (config.apiKey ? `&key=${config.apiKey}` : '');
+                const response = await fetch(url, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    headers: headers,
+                    body: JSON.stringify({ context: config.context, videoId: videoId })
                 });
                 if (!response.ok) {
                     return undefined;
                 }
 
-                const data = await response.json();
-                const info = data.microformat.playerMicroformatRenderer;
+                const info = (await response.json()).microformat?.playerMicroformatRenderer;
+                if (!info) {
+                    return undefined;
+                }
 
                 // A stream that is live right now uses its start time. Anything
                 // else (including finished streams) uses its publish date.
@@ -294,18 +396,19 @@
         // Read the upload date embedded in the current watch page.
         function parseUploadDate() {
             const el = document.body.querySelector('player-microformat-renderer script');
-            if (el) {
-                const startParts = el.textContent.split('"startDate":"', 2);
-                if (startParts.length === 2) {
-                    return startParts[1].split('"', 1)[0];
-                }
-
-                const uploadParts = el.textContent.split('"uploadDate":"', 2);
-                if (uploadParts.length === 2) {
-                    return uploadParts[1].split('"', 1)[0];
-                }
+            if (!el) {
+                return null;
             }
-            return null;
+
+            try {
+                const data = JSON.parse(el.textContent);
+                return data.startDate || data.uploadDate || null;
+            }
+            catch (error) {
+                // The script tag can be empty while YouTube is still filling in
+                // the page. This runs again on the next page change.
+                return null;
+            }
         }
 
         const uploadDate = parseUploadDate();
