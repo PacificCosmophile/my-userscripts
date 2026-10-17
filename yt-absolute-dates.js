@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name             YT Absolute Date
+// @name             YT Absolute Dates
 // @namespace        https://github.com/PacificCosmophile
 // @description      Replaces relative upload dates ("2 years ago") with absolute dates across YouTube.
-// @version          2.1
+// @version          2.2
 // @author           PacificCosmophile+Vibecoded
 // @license          MIT
 // @match            https://www.youtube.com/*
