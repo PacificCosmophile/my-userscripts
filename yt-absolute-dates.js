@@ -2,7 +2,7 @@
 // @name             YT Absolute Dates
 // @namespace        https://github.com/PacificCosmophile
 // @description      Replaces relative upload dates ("2 years ago") with absolute dates across YouTube.
-// @version          2.2
+// @version          2.3
 // @author           PacificCosmophile+Vibecoded
 // @license          MIT
 // @match            https://www.youtube.com/*
@@ -28,6 +28,7 @@
     // from its elements, but it keeps the text, so the text carries the state.
     const PROCESSED_MARKER = '\u200B'; // Zero-width space, marks a rendered date
     const PENDING_MARKER = '\u2060';   // Word joiner, marks an in-flight fetch
+    const MARKER_PATTERN = new RegExp(`[${PROCESSED_MARKER}${PENDING_MARKER}]`, 'g');
 
     // Shorts get their own label element. It shows "…" until the date arrives.
     const LABEL_CLASS = 'abs-date-label';
@@ -47,6 +48,14 @@
     // without time, e.g. "10 Oct 2026". Everything else gets date and time.
     const COMPACT_DATE_AREAS = 'ytd-watch-next-secondary-results-renderer, #secondary, ytd-compact-video-renderer';
 
+    // Links that point to a video. A Short that appears in a normal result list
+    // (for example in search results) links to /shorts/ instead of /watch.
+    const VIDEO_LINK_SELECTOR = 'a[href^="/watch?v="], a[href^="/shorts/"]';
+
+    // Places that get their date from the Shorts code (see `Shorts` below), so
+    // their links are not treated as video cards.
+    const SHORTS_AREAS = 'ytm-shorts-lockup-view-model, ytd-reel-item-renderer, ytd-reel-video-renderer';
+
     // Maximum number of levels to walk up when locating a video card.
     const MAX_CARD_LEVELS = 10;
 
@@ -64,6 +73,15 @@
     // How long the login headers of a request are reused. They contain a hash
     // with a timestamp, so they are rebuilt now and then (milliseconds).
     const AUTH_HEADERS_TTL = 5 * 60 * 1000;
+
+    // When a date request fails, the card is tried again after RETRY_DELAY. The
+    // page may not change again, and then nothing else would wake the script
+    // up. After MAX_FAILURES failures in a row a video is left alone for
+    // FAILURE_COOLDOWN, so a private or members-only video does not cause
+    // endless requests (milliseconds).
+    const RETRY_DELAY = 2000;
+    const MAX_FAILURES = 3;
+    const FAILURE_COOLDOWN = 60 * 1000;
 
     // =========================================================================
     // Utils
@@ -173,6 +191,14 @@
         // never requested twice at the same time. A failed request is removed
         // so it can be retried on a later run.
         _requests: new Map(),
+
+        // videoId -> { count, time } of the latest failed requests.
+        _failures: new Map(),
+
+        // Date element -> id of the video it was last claimed for. YouTube
+        // reuses the same elements for other videos (for example after a new
+        // search), so a marker in the text does not say whose date it is.
+        _videoOf: new WeakMap(),
 
         // Login headers, shared by all requests until they get too old. This is
         // a Promise, so videos requested at the same moment build them only once.
@@ -309,15 +335,47 @@
          */
         getUploadDate(videoId) {
             if (!this._requests.has(videoId)) {
+                if (this.isCoolingDown(videoId)) {
+                    return Promise.resolve(undefined);
+                }
+
                 const request = this._fetch(videoId).then(date => {
-                    if (!date) {
+                    if (date) {
+                        this._failures.delete(videoId);
+                    }
+                    else {
                         this._requests.delete(videoId);
+                        this._noteFailure(videoId);
                     }
                     return date;
                 });
                 this._requests.set(videoId, request);
             }
             return this._requests.get(videoId);
+        },
+
+        _noteFailure(videoId) {
+            const previous = this._failures.get(videoId);
+            const recent = previous && Date.now() - previous.time < FAILURE_COOLDOWN;
+            this._failures.set(videoId, { count: (recent ? previous.count : 0) + 1, time: Date.now() });
+        },
+
+        /**
+         * True when this video failed MAX_FAILURES times in a row recently, so
+         * it is not requested (or retried) for a while.
+         */
+        isCoolingDown(videoId) {
+            const failure = this._failures.get(videoId);
+            return !!failure && failure.count >= MAX_FAILURES && Date.now() - failure.time < FAILURE_COOLDOWN;
+        },
+
+        /**
+         * @returns {boolean} True when the element shows the finished absolute
+         *     date of this video.
+         */
+        isDone(videoId, elem) {
+            const text = elem.firstChild?.nodeValue;
+            return !!text && text.includes(PROCESSED_MARKER) && this._videoOf.get(elem) === videoId;
         },
 
         /**
@@ -327,7 +385,7 @@
          * state so callers can avoid duplicate work without losing retries:
          * - 'notReady': the element has no text yet, retry on a later run.
          * - 'pending':  a fetch for this element is in flight, skip.
-         * - 'done':     the absolute date is already rendered, skip.
+         * - 'done':     the absolute date of this video is already rendered, skip.
          * - 'updated':  the element was just claimed, the fetch has started.
          *
          * @param {string} videoId - YouTube video ID.
@@ -343,27 +401,35 @@
             if (!text) {
                 return 'notReady';
             }
-            if (text.includes(PROCESSED_MARKER)) {
-                return 'done';
+
+            // Markers only count when the element still belongs to this video.
+            // Otherwise they are leftovers of the previous video: the element
+            // is claimed again, and the markers are removed from its text.
+            if (this._videoOf.get(elem) === videoId) {
+                if (text.includes(PROCESSED_MARKER)) {
+                    return 'done';
+                }
+                if (text.includes(PENDING_MARKER)) {
+                    return 'pending';
+                }
             }
-            if (text.includes(PENDING_MARKER)) {
-                return 'pending';
-            }
+            const cleanText = text.replace(MARKER_PATTERN, '');
 
             let prefix = '';
             if (separator) {
-                const cut = text.lastIndexOf(separator);
+                const cut = cleanText.lastIndexOf(separator);
                 if (cut === -1) {
                     return 'notReady';
                 }
-                prefix = text.slice(0, cut + separator.length);
+                prefix = cleanText.slice(0, cut + separator.length);
             }
 
             // Claim the element. The marker becomes PROCESSED_MARKER once the
             // date is rendered, or the original text comes back if it fails.
-            node.nodeValue = text + PENDING_MARKER;
+            node.nodeValue = cleanText + PENDING_MARKER;
+            this._videoOf.set(elem, videoId);
 
-            this._render(videoId, elem, text, prefix);
+            this._render(videoId, elem, cleanText, prefix);
             return 'updated';
         },
 
@@ -371,16 +437,23 @@
             const uploadDate = await this.getUploadDate(videoId);
             const formatted = DateFormatter.format(uploadDate, this._isCompact(elem));
 
-            // YouTube may have reused the element for another video while we
-            // waited. Then our marker is gone and the element is left alone.
+            // YouTube may have changed the element while we waited, either by
+            // rewriting its text (our marker is gone) or by reusing it for
+            // another video. Then it is left alone and looked at again soon.
             const node = elem.firstChild;
-            if (!node || !node.nodeValue?.includes(PENDING_MARKER)) {
+            const stillClaimed = node?.nodeValue?.includes(PENDING_MARKER) && this._videoOf.get(elem) === videoId;
+            if (!stillClaimed) {
+                PageHandler.runSoon();
                 return;
             }
 
             // On failure the original text returns without any marker, so the
-            // element is picked up again on a later run.
+            // element is picked up again by the run scheduled below. After a
+            // success the run checks that YouTube did not overwrite the date.
             node.nodeValue = formatted ? prefix + formatted + PROCESSED_MARKER : originalText;
+            if (formatted || (!uploadDate && !this.isCoolingDown(videoId))) {
+                PageHandler.runSoon();
+            }
         },
 
         _isCompact(elem) {
@@ -460,10 +533,11 @@
      * yields a date element.
      */
     const VideoCard = {
-        // Links that have been processed, mapped to the video id they were
-        // processed for. YouTube may keep the same <a> and only change its href,
-        // so a link is processed again when its video id changes. A WeakMap
-        // releases entries automatically when the link is removed.
+        // Links that have been processed, mapped to their date element. YouTube
+        // may keep the same <a> and only change its href, or rewrite the date
+        // text later, so a link is skipped only while its date element still
+        // shows the finished date of the same video (see DateUpdater.isDone). A
+        // WeakMap releases entries automatically when the link is removed.
         _processedLinks: new WeakMap(),
 
         // True while a continuation run is queued, so that several runs
@@ -478,9 +552,9 @@
         _getVideoLinks() {
             const links = [];
             const ids = [];
-            for (const link of document.querySelectorAll('a[href^="/watch?v="]')) {
+            for (const link of document.querySelectorAll(VIDEO_LINK_SELECTOR)) {
                 const id = Helpers.urlToVideoId(link.getAttribute('href'));
-                if (id) {
+                if (id && !link.closest(SHORTS_AREAS)) {
                     links.push(link);
                     ids.push(id);
                 }
@@ -513,7 +587,7 @@
          * are rejected.
          */
         _isValidCard(card, videoId) {
-            const anchors = card.querySelectorAll('a[href^="/watch?v="]');
+            const anchors = card.querySelectorAll(VIDEO_LINK_SELECTOR);
             if (anchors.length === 0) {
                 return false;
             }
@@ -528,14 +602,16 @@
         /**
          * The uploader, view count and date are `[role="group"] [role="text"]`
          * elements; the date is the last one of the group that holds the view
-         * count. A group with a single text (the uploader) is skipped, and so is
-         * a group whose first text has a playlist keyword.
+         * count. Search results use `#video-info` as the group and
+         * `[dir="auto"]` as the texts instead. A group with a single text (the
+         * uploader) is skipped, and so is a group whose first text has a
+         * playlist keyword.
          */
         _findDateElement(node) {
             let dateElem = null;
 
-            for (const group of node.querySelectorAll('[role="group"]')) {
-                const texts = group.querySelectorAll('[role="text"]');
+            for (const group of node.querySelectorAll('[role="group"], #video-info')) {
+                const texts = group.querySelectorAll('[role="text"], [dir="auto"]');
                 if (texts.length <= 1) {
                     continue;
                 }
@@ -548,9 +624,9 @@
                 dateElem = texts[texts.length - 1];
             }
 
-            // Older card layout, used by search results. It has no `role`
-            // attributes: the line "18 lakh views • 3 hr ago" is two plain
-            // `inline-metadata-item` spans, and the date is the last one.
+            // Older search result layout. It has no `role` attributes: the line
+            // "18 lakh views • 3 hr ago" is two plain `inline-metadata-item`
+            // spans, and the date is the last one.
             // Two spans are needed, so a single "watching" span is skipped.
             if (!dateElem) {
                 const spans = node.querySelectorAll('span.inline-metadata-item');
@@ -597,8 +673,9 @@
                 const link = links[index];
                 const videoId = ids[index];
 
-                // Skip links already processed for the same video.
-                if (this._processedLinks.get(link) === videoId) {
+                // Skip links whose date is already shown.
+                const knownDateElem = this._processedLinks.get(link);
+                if (knownDateElem && DateUpdater.isDone(videoId, knownDateElem)) {
                     continue;
                 }
 
@@ -612,7 +689,7 @@
                 // Remember the link only once the absolute date is rendered. A
                 // failed fetch removes the marker, so the card is retried later.
                 if (status === 'done') {
-                    this._processedLinks.set(link, videoId);
+                    this._processedLinks.set(link, dateElem);
                     continue;
                 }
 
@@ -650,7 +727,11 @@
                 label.textContent = PLACEHOLDER;
             }
 
-            const text = DateFormatter.format(await DateUpdater.getUploadDate(videoId));
+            const uploadDate = await DateUpdater.getUploadDate(videoId);
+            const text = DateFormatter.format(uploadDate);
+            if (!uploadDate && !DateUpdater.isCoolingDown(videoId)) {
+                PageHandler.runSoon();
+            }
 
             // Skip if the label was removed or reused meanwhile. The text is
             // only written when it differs, so no needless page change fires.
@@ -743,6 +824,7 @@
 
         _debouncedRun: null,
         _subscriptionsTimer: null,
+        _retryTimer: null,
 
         start() {
             this._debouncedRun = Utils.debounce(() => this.runAllFormatters());
@@ -755,6 +837,21 @@
             this._startObserver();
             this._syncSubscriptionsTimer();
             this.runAllFormatters();
+        },
+
+        /**
+         * Run once more after RETRY_DELAY, for work that did not finish and
+         * will not be triggered by a page change. Calls in the meantime share
+         * the same run.
+         */
+        runSoon() {
+            if (this._retryTimer !== null) {
+                return;
+            }
+            this._retryTimer = setTimeout(() => {
+                this._retryTimer = null;
+                this.runAllFormatters();
+            }, RETRY_DELAY);
         },
 
         /**
