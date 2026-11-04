@@ -21,11 +21,8 @@
 (()=> {
     'use strict';
 
-    const hideStyle=document.createElement('style');
-    hideStyle.textContent=`relative-time:not([data-ad-patched]) {
-        visibility: hidden !important;
-    }
-    `;
+    // Keep formatting preferences in memory instead of reading GM storage for every element.
+    let dateFormat=GM_getValue('format', 'YYYY/MM/DD HH:mm');
 
     const months=['January', 'February', 'March', 'April', 'May', 'June',
         'July', 'August', 'September', 'October', 'November', 'December'];
@@ -34,7 +31,7 @@
     const pad=(number, length=2)=>String(number).padStart(length, '0');
 
     // Supports the standard Day.js format tokens without loading Day.js.
-    const formatDate=(datetime, format=GM_getValue('format', 'YYYY/MM/DD HH:mm'))=> {
+    const formatDate=(datetime, format=dateFormat)=> {
         const date=datetime instanceof Date ? datetime : new Date(datetime);
         if (Number.isNaN(date.getTime())) return 'Invalid Date';
 
@@ -66,87 +63,69 @@
         return String(format).replace(/\[([^\]]+)\]|YYYY|YY|MMMM|MMM|MM|M|DD|D|dddd|ddd|dd|d|HH|H|hh|h|mm|m|ss|s|SSS|ZZ|Z|A|a/g,
             (token, literal)=>literal !== undefined ? literal : values[token]);
     };
-    function getFormatted(el) {
-        const datetime=el.getAttribute('datetime');
-        if (!datetime) return null;
-        return formatDate(datetime);
-    }
+    // Rendering is CSS-only; never overwrite GitHub's light or shadow DOM text.
+    // A single document observer detects newly inserted elements and datetime edits.
+    const pendingElements=new Set();
+    let flushScheduled=false;
 
     function patchElement(el) {
-        if (el.dataset.adPatched || el.dataset.adPatching) return;
-        el.dataset.adPatching='true';
+        if (!el.isConnected) return;
 
-        const tryPatch=(attempts=0)=> {
-            if (!el.isConnected) {
-                delete el.dataset.adPatching;
-                return;
-            }
-            if (!el.shadowRoot) {
-                if (attempts > 300) {
-                    delete el.dataset.adPatching;
-                    el.dataset.adPatched='true';
-                    return;
-                }
-                requestAnimationFrame(()=> tryPatch(attempts + 1));
-                return;
-            }
+        const datetime=el.getAttribute('datetime');
+        const date=datetime ? new Date(datetime) : null;
+        const valid=date && !Number.isNaN(date.getTime());
 
-            const formatted=getFormatted(el);
-            if (!formatted) {
-                if (attempts > 300) {
-                    delete el.dataset.adPatching;
-                    el.dataset.adPatched='true';
-                    return;
-                }
-                requestAnimationFrame(()=> tryPatch(attempts + 1));
-                return;
-            }
+        // Fail open: keep the native GitHub rendering if this component's structure changes.
+        // This is only a read; no writes occur inside its shadow root.
+        const supported=Boolean(el.shadowRoot?.querySelector('[part="root"]'));
+        const formatted=valid && supported ? formatDate(date) : null;
+        const previous=el.getAttribute('data-ad-date');
 
-            const shadowObserver=new MutationObserver(()=> write());
-            const write=()=> {
-                const f=getFormatted(el);
-                if (!f) return;
-
-                shadowObserver.disconnect();
-                const content=el.shadowRoot.querySelector('[part="root"]');
-                if (content) content.textContent=f;
-                else el.shadowRoot.textContent=f;
-                el.textContent=f;
-                shadowObserver.observe(el.shadowRoot, {
-                    childList: true,
-                    characterData: true,
-                    subtree: true
-                });
-            };
-
-            write();
-            el.dataset.adPatched='true';
-            el._adWrite=write;
-        };
-        tryPatch();
+        if (formatted === null) {
+            if (previous !== null) el.removeAttribute('data-ad-date');
+        } else if (previous !== formatted) {
+            el.setAttribute('data-ad-date', formatted);
+        }
     }
 
-    function processAll(root=document) {
-        root.querySelectorAll('relative-time').forEach(patchElement);
+    function flushPending() {
+        flushScheduled=false;
+        const elements=Array.from(pendingElements);
+        pendingElements.clear();
+        for (const el of elements) patchElement(el);
     }
-    function reprocessAll() {
-        document.querySelectorAll('relative-time').forEach((el)=> {
-            if (el._adWrite) el._adWrite();
-        });
+
+    function enqueue(el) {
+        pendingElements.add(el);
+        if (!flushScheduled) {
+            flushScheduled=true;
+            queueMicrotask(flushPending);
+        }
     }
+
+    function processAll() {
+        document.querySelectorAll('relative-time').forEach(enqueue);
+    }
+
     function watchForNewElements() {
-        const bodyObserver=new MutationObserver((mutations)=> {
+        const observer=new MutationObserver((mutations)=> {
             for (const mutation of mutations) {
+                if (mutation.type==='attributes') {
+                    enqueue(mutation.target);
+                    continue;
+                }
                 for (const node of mutation.addedNodes) {
-                    if (node.nodeType !== Node.ELEMENT_NODE) continue;
-                    if (node.matches?.('relative-time')) patchElement(node);
-                    node.querySelectorAll?.('relative-time').forEach(patchElement);
+                    if (node.nodeType!==Node.ELEMENT_NODE) continue;
+                    if (node.matches('relative-time')) enqueue(node);
+                    node.querySelectorAll('relative-time').forEach(enqueue);
                 }
             }
         });
-        bodyObserver.observe(document.documentElement, {
+        observer.observe(document.documentElement, {
             childList: true,
-            subtree: true
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['datetime']
         });
     }
 
@@ -160,11 +139,19 @@
         [aria-labelledby$="files"] relative-time {
             font-variant-numeric: var(--absolute-date-aligned);
         }
-        relative-time::before {
+        /* Hide only the native rendering, not the host or its attributes. */
+        relative-time[data-ad-date]::part(root) {
+            display: none !important;
+        }
+        /* The absolute date is generated from one inert host data attribute. */
+        relative-time[data-ad-date]::after {
+            content: attr(data-ad-date);
+        }
+        relative-time[data-ad-date]::before {
             content: var(--absolute-date-preposition);
         }
-        [aria-labelledby$="files"] relative-time::before {
-            content: unset
+        [aria-labelledby$="files"] relative-time[data-ad-date]::before {
+            content: unset;
         }
         `);
     }
@@ -284,12 +271,13 @@
 
         overlay.querySelector('#ad-save').onclick=()=> {
             GM_setValue('preposition', overlay.querySelector('#ad-preposition').value);
-            GM_setValue('format', overlay.querySelector('#ad-format').value);
+            dateFormat=overlay.querySelector('#ad-format').value;
+            GM_setValue('format', dateFormat);
             GM_setValue('aligned', overlay.querySelector('#ad-aligned').checked);
             closeDialog();
             setDatesAligned();
             setPreposition();
-            reprocessAll();
+            processAll();
         };
     }
 
@@ -555,21 +543,27 @@
         addSettingsStyle();
         setDatesAligned();
         setPreposition();
-        watchForNewElements();
-        processAll();
+
+        // A defined GitHub custom element has a stable shadow-root interface.
+        // No per-frame polling or timers are necessary.
+        customElements.whenDefined('relative-time').then(()=> {
+            watchForNewElements();
+            processAll();
+        });
+
+        // GitHub Turbo navigation may reuse existing nodes.
         document.addEventListener('turbo:render', ()=> {
             setDatesAligned();
             setPreposition();
-            reprocessAll();
+            processAll();
         });
     }
 
     function start() {
         if (!document.documentElement) {
-            document.addEventListener('readystatechange', start, { once: true });
+            document.addEventListener('readystatechange', start, {once:true});
             return;
         }
-        document.documentElement.appendChild(hideStyle);
         init();
     }
     start();
